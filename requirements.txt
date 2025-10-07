@@ -1,0 +1,6 @@
+shazamio 
+aiohttp 
+mutagen 
+requests 
+termcolor 
+colorama
