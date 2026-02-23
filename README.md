@@ -2,6 +2,8 @@
 
 Identify MP3 tracks by audio with Shazam, rename files, and write ID3 tags.
 
+![PythonShazzam app](app.webp)
+
 ## Install
 
 ```bash
