@@ -4,3 +4,5 @@ mutagen
 requests 
 termcolor 
 colorama
+audioop-lts; python_version >= "3.13"
+Pillow

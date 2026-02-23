@@ -23,6 +23,12 @@ from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB
 from mutagen.mp3 import MP3
 from shazamio import Shazam
 
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 @dataclass
 class TrackInfo:
     artist: str
@@ -44,9 +50,9 @@ class FileResult:
 INVALID_WIN_RE = re.compile(r'[<>:"/\\|?*]')
 MULTISPACE_RE = re.compile(r"\s+")
 
-SYMBOL_OK = "✓"
-SYMBOL_ERR = "✗"
-SYMBOL_WARN = "⚠"
+SYMBOL_OK = "OK"
+SYMBOL_ERR = "ERR"
+SYMBOL_WARN = "WARN"
 
 def sanitize_filename(name: str) -> str:
     name = INVALID_WIN_RE.sub(" ", name)
@@ -187,11 +193,11 @@ def term_width(default: int = 100) -> int:
         return default
 
 def trunc(s: str, maxlen: int) -> str:
-    return s if len(s) <= maxlen else s[:maxlen-1] + "…"
+    return s if len(s) <= maxlen else s[:maxlen-3] + "..."
 
 def render_bar(frac: float, width: int) -> str:
     filled = int(frac * width)
-    return "█" * filled + "░" * (width - filled)
+    return "#" * filled + "-" * (width - filled)
 
 def print_progress(current: int, total: int, start_time: float, label: str, status: str, width_min: int = 70):
     cols = max(term_width(), width_min)
@@ -226,7 +232,7 @@ async def process_files_async(files: List[Path], args) -> Dict[str, Any]:
     for i, orig_path in enumerate(files, 1):
         result = FileResult(src_name=orig_path.name, dest_name=orig_path.name)
         path = orig_path
-        status = "ID…"
+        status = "ID..."
         if not args.verbose:
             print_progress(i, len(files), start, label=orig_path.name, status=status)
 
@@ -247,10 +253,10 @@ async def process_files_async(files: List[Path], args) -> Dict[str, Any]:
             if args.verbose:
                 album_msg = ti.album if ti.album else colored("unknown", "yellow")
                 cov = colored("yes", "magenta") if ti.cover_url else colored("no", "yellow")
-                print(colored(f"[ID]   {path.name} → {ti.artist} — {ti.title}", "cyan"))
+                print(colored(f"[ID]   {path.name} -> {ti.artist} - {ti.title}", "cyan"))
                 print(f"[META] album={album_msg!s} cover={cov}")
 
-            status = "RENAME…"
+            status = "RENAME..."
             if not args.verbose:
                 print_progress(i, len(files), start, label=orig_path.name, status=status)
             new_name = make_target_filename(ti.artist, ti.title, ti.album)
@@ -259,9 +265,9 @@ async def process_files_async(files: List[Path], args) -> Dict[str, Any]:
                 result.dest_name = path.name
                 result.renamed = True
                 if args.verbose:
-                    print(colored(f"[NAME] {orig_path.name} → {path.name}", "cyan"))
+                    print(colored(f"[NAME] {orig_path.name} -> {path.name}", "cyan"))
 
-            status = "TAGS/ART…"
+            status = "TAGS/ART..."
             if not args.verbose:
                 print_progress(i, len(files), start, label=path.name, status=status)
             if not args.dry_run:
@@ -295,7 +301,7 @@ async def process_files_async(files: List[Path], args) -> Dict[str, Any]:
             if result.skipped: flags.append(paint_tag("SKIP"))
             if result.error:   flags.append(paint_tag("ERR"))
             flags_str = ", ".join(flags) if flags else "no-op"
-            print(f"[OK]   {result.src_name} → {result.dest_name}  ({flags_str})")
+            print(f"[OK]   {result.src_name} -> {result.dest_name}  ({flags_str})")
 
     elapsed = time.time() - start
     if not args.verbose:
@@ -320,7 +326,7 @@ def print_summary(summary: Dict[str, Any]):
     print("\n" + colored("Results", "white", attrs=["bold"]) + ":")
     name_w = max(24, min(60, max(len(r.src_name) for r in summary["results"])))
     dest_w = max(24, min(60, max(len(r.dest_name) for r in summary["results"])))
-    header = f"{'Source':<{name_w}}  →  {'Dest':<{dest_w}}  |  Status"
+    header = f"{'Source':<{name_w}}  ->  {'Dest':<{dest_w}}  |  Status"
     print(colored(header, "cyan", attrs=["bold"]))
     print(colored("-" * len(header), "cyan"))
 
@@ -334,7 +340,7 @@ def print_summary(summary: Dict[str, Any]):
         status = ", ".join(bits) if bits else "-"
         if r.error:
             status += " " + colored(f"({r.error})", "red")
-        print(f"{r.src_name:<{name_w}}  →  {r.dest_name:<{dest_w}}  |  {status}")
+        print(f"{r.src_name:<{name_w}}  ->  {r.dest_name:<{dest_w}}  |  {status}")
 
 def main():
     ap = argparse.ArgumentParser(description="Identify MP3s with Shazam, rename to 'Artist - Title - Album.mp3', embed cover art, and colorize status.")
@@ -354,7 +360,7 @@ def main():
     if not files:
         print(colored("No MP3 files found.", "yellow", attrs=["bold"])); return
 
-    print(colored(f"Processing {len(files)} MP3 files…", "white", attrs=["bold"]) + "\n")
+    print(colored(f"Processing {len(files)} MP3 files...", "white", attrs=["bold"]) + "\n")
 
     try:
         summary = asyncio.run(process_files_async(files, args))
