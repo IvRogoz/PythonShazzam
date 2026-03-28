@@ -5,7 +5,9 @@ import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +18,7 @@ from mutagen.mp3 import MP3
 import requests
 
 from music import TrackInfo, Shazam, gather_files, make_target_filename, safe_rename, shazam_identify_file, update_tags
+from system_audio import AudioCaptureError, LiveAudioListener, LiveTrackResult, SOURCE_LABELS
 
 
 @dataclass
@@ -65,6 +68,28 @@ class PythonShazzamGUI(tk.Tk):
         self.menu_path: str | None = None
         self.selected_row_path: str | None = None
         self.colors: dict[str, str] = {}
+        self.listen_modal: tk.Toplevel | None = None
+        self.listen_source_var = tk.StringVar(value="system")
+        self.listen_auto_preview_var = tk.BooleanVar(value=True)
+        self.listen_canvas: tk.Canvas | None = None
+        self.listen_caption_id: int | None = None
+        self.listen_hint_var = tk.StringVar(value="Choose a source and press Listen.")
+        self.listen_options_frame: tk.Frame | None = None
+        self.listen_source_menu: ttk.Combobox | None = None
+        self.listen_results_var = tk.StringVar(value=())
+        self.listen_results_list: tk.Listbox | None = None
+        self.listen_thread: threading.Thread | None = None
+        self.listen_stop_event = threading.Event()
+        self.listen_results: list[str] = []
+        self.listen_wave_canvas: tk.Canvas | None = None
+        self.listen_wave_levels: list[float] = [0.0] * 160
+        self.listen_found_title_var = tk.StringVar(value="No track found yet")
+        self.listen_found_meta_var = tk.StringVar(value="Start listening to show the latest match.")
+        self.listen_found_link_var = tk.StringVar(value="")
+        self.listen_found_cover_label: tk.Label | None = None
+        self.listen_found_link_label: tk.Label | None = None
+        self.listen_found_cover_photo: ImageTk.PhotoImage | None = None
+        self.listen_found_url: str | None = None
 
         self.row_menu = tk.Menu(self, tearoff=0)
         self.row_menu.add_command(label="Open File", command=self._open_item_file)
@@ -150,6 +175,7 @@ class PythonShazzamGUI(tk.Tk):
         if hasattr(self, "list_canvas"):
             self.list_canvas.configure(bg=self.colors["canvas_bg"])
         self.row_menu.configure(bg=self.colors["card_bg"], fg=self.colors["text_fg"], activebackground=accent_bg, activeforeground="#FFFFFF")
+        self._refresh_listen_modal_theme()
 
     def _on_theme_toggle(self) -> None:
         self._apply_theme()
@@ -190,6 +216,8 @@ class PythonShazzamGUI(tk.Tk):
         actions.grid(row=4, column=1, columnspan=2, sticky="e")
         self.run_btn = ttk.Button(actions, text="Start Processing", command=self._start_run)
         self.run_btn.pack(side="left", padx=(0, 8))
+        self.listen_btn = ttk.Button(actions, text="Listen Mode", command=self._open_listen_modal)
+        self.listen_btn.pack(side="left", padx=(0, 8))
         self.apply_btn = ttk.Button(actions, text="Apply Pending", command=self._start_apply, state="disabled")
         self.apply_btn.pack(side="left", padx=(0, 8))
         self.stop_btn = ttk.Button(actions, text="Stop", command=self._stop_run, state="disabled")
@@ -228,6 +256,481 @@ class PythonShazzamGUI(tk.Tk):
     def _on_mousewheel(self, event: tk.Event) -> None:
         if self.list_canvas.winfo_exists():
             self.list_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _open_listen_modal(self) -> None:
+        if self.listen_modal and self.listen_modal.winfo_exists():
+            self.listen_modal.deiconify()
+            self.listen_modal.lift()
+            self.listen_modal.focus_force()
+            return
+
+        modal = tk.Toplevel(self)
+        modal.title("Listen")
+        modal.transient(self)
+        modal.grab_set()
+        modal.resizable(False, False)
+        modal.protocol("WM_DELETE_WINDOW", self._close_listen_modal)
+        modal.geometry("500x860")
+
+        shell = tk.Frame(modal, bg=self.colors["root_bg"], padx=24, pady=24)
+        shell.pack(fill="both", expand=True)
+
+        tk.Label(
+            shell,
+            text="Listen",
+            bg=self.colors["root_bg"],
+            fg=self.colors["title_fg"],
+            font=("Segoe UI Semibold", 20),
+        ).pack(anchor="center", pady=(0, 18))
+
+        canvas = tk.Canvas(shell, width=240, height=240, highlightthickness=0, bd=0, cursor="hand2")
+        canvas.pack(pady=(0, 24))
+        self.listen_canvas = canvas
+        self._draw_listen_button()
+        canvas.bind("<Button-1>", lambda _event: self._on_listen_pressed())
+
+        wave_canvas = tk.Canvas(shell, width=320, height=72, highlightthickness=0, bd=0)
+        wave_canvas.pack(pady=(0, 24))
+        self.listen_wave_canvas = wave_canvas
+        self._draw_listen_waveform()
+
+        options = tk.Frame(shell, bg=self.colors["card_bg"], highlightthickness=1)
+        options.pack(fill="x", pady=(0, 12))
+        self.listen_options_frame = options
+
+        tk.Label(
+            options,
+            text="Source",
+            bg=self.colors["card_bg"],
+            fg=self.colors["text_fg"],
+            font=("Segoe UI Semibold", 11),
+            padx=14,
+            pady=12,
+        ).pack(anchor="w")
+
+        source_menu = ttk.Combobox(
+            options,
+            state="readonly",
+            values=("Local listen", "System audio", "Both"),
+            font=("Segoe UI", 11),
+        )
+        source_menu.pack(fill="x", padx=14, pady=(0, 10))
+        source_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_listen_source_change())
+        source_menu.set(self._listen_source_label(self.listen_source_var.get()))
+        self.listen_source_menu = source_menu
+
+        preview_row = tk.Frame(options, bg=self.colors["card_bg"])
+        preview_row.pack(fill="x", padx=14, pady=(0, 8))
+
+        tk.Label(
+            preview_row,
+            text="Auto preview",
+            bg=self.colors["card_bg"],
+            fg=self.colors["text_fg"],
+            font=("Segoe UI", 10),
+        ).pack(side="left")
+
+        tk.Checkbutton(
+            preview_row,
+            text="Play sample before Shazam",
+            variable=self.listen_auto_preview_var,
+            bg=self.colors["card_bg"],
+            fg=self.colors["text_fg"],
+            selectcolor=self.colors["card_bg"],
+            activebackground=self.colors["card_bg"],
+            activeforeground=self.colors["text_fg"],
+            font=("Segoe UI", 10),
+            padx=8,
+        ).pack(side="right")
+
+        tk.Label(
+            options,
+            text="Capture from a local microphone, the current computer output, or both.",
+            bg=self.colors["card_bg"],
+            fg=self.colors["hint_fg"],
+            font=("Segoe UI", 9),
+            wraplength=360,
+            justify="left",
+            padx=14,
+            pady=2,
+        ).pack(fill="x", anchor="w")
+
+        tk.Label(
+            shell,
+            textvariable=self.listen_hint_var,
+            bg=self.colors["root_bg"],
+            fg=self.colors["hint_fg"],
+            font=("Segoe UI", 10),
+            wraplength=340,
+            justify="center",
+            pady=8,
+        ).pack()
+
+        found_card = tk.Frame(shell, bg=self.colors["card_bg"], highlightthickness=1)
+        found_card.pack(fill="x", pady=(0, 16))
+
+        tk.Label(
+            found_card,
+            text="Found Audio",
+            bg=self.colors["card_bg"],
+            fg=self.colors["text_fg"],
+            font=("Segoe UI Semibold", 11),
+            padx=14,
+            pady=12,
+        ).pack(anchor="w")
+
+        found_inner = tk.Frame(found_card, bg=self.colors["card_bg"])
+        found_inner.pack(fill="x", padx=12, pady=(0, 12))
+
+        cover_label = tk.Label(found_inner, bg=self.colors["card_bg"])
+        cover_label.pack(side="left", padx=(0, 12))
+        self.listen_found_cover_label = cover_label
+
+        found_text = tk.Frame(found_inner, bg=self.colors["card_bg"])
+        found_text.pack(side="left", fill="x", expand=True)
+
+        tk.Label(
+            found_text,
+            textvariable=self.listen_found_title_var,
+            bg=self.colors["card_bg"],
+            fg=self.colors["text_fg"],
+            font=("Segoe UI Semibold", 12),
+            anchor="w",
+            justify="left",
+            wraplength=300,
+        ).pack(anchor="w", fill="x")
+
+        tk.Label(
+            found_text,
+            textvariable=self.listen_found_meta_var,
+            bg=self.colors["card_bg"],
+            fg=self.colors["hint_fg"],
+            font=("Segoe UI", 10),
+            anchor="w",
+            justify="left",
+            wraplength=300,
+            pady=4,
+        ).pack(anchor="w", fill="x")
+
+        link_label = tk.Label(
+            found_text,
+            textvariable=self.listen_found_link_var,
+            bg=self.colors["card_bg"],
+            fg="#38BDF8" if self.dark_mode_var.get() else "#0369A1",
+            font=("Segoe UI", 10, "underline"),
+            cursor="hand2",
+            anchor="w",
+            justify="left",
+            wraplength=300,
+        )
+        link_label.pack(anchor="w", fill="x")
+        link_label.bind("<Button-1>", lambda _event: self._open_listen_found_link())
+        self.listen_found_link_label = link_label
+        self._refresh_listen_found_card()
+
+        results_card = tk.Frame(shell, bg=self.colors["card_bg"], highlightthickness=1)
+        results_card.pack(fill="both", expand=True, pady=(0, 12))
+
+        tk.Label(
+            results_card,
+            text="Live Results",
+            bg=self.colors["card_bg"],
+            fg=self.colors["text_fg"],
+            font=("Segoe UI Semibold", 11),
+            padx=14,
+            pady=12,
+        ).pack(anchor="w")
+
+        results_inner = tk.Frame(results_card, bg=self.colors["card_bg"])
+        results_inner.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        results_list = tk.Listbox(
+            results_inner,
+            listvariable=self.listen_results_var,
+            activestyle="none",
+            relief="flat",
+            highlightthickness=0,
+            borderwidth=0,
+            font=("Consolas", 10),
+        )
+        results_scroll = ttk.Scrollbar(results_inner, orient="vertical", command=results_list.yview)
+        results_list.configure(yscrollcommand=results_scroll.set)
+        results_list.pack(side="left", fill="both", expand=True)
+        results_scroll.pack(side="right", fill="y")
+        self.listen_results_list = results_list
+        self._refresh_listen_results()
+
+        actions = ttk.Frame(shell, style="Root.TFrame")
+        actions.pack(fill="x")
+        ttk.Button(actions, text="Clear Results", command=self._clear_listen_results).pack(side="left")
+        ttk.Button(actions, text="Close", command=self._close_listen_modal).pack(side="right")
+
+        self.listen_modal = modal
+        self._refresh_listen_modal_theme()
+        self.update_idletasks()
+        x = self.winfo_rootx() + max((self.winfo_width() - 500) // 2, 0)
+        y = self.winfo_rooty() + max((self.winfo_height() - 860) // 2, 0)
+        modal.geometry(f"+{x}+{y}")
+
+    def _draw_listen_button(self) -> None:
+        if not self.listen_canvas or not self.listen_canvas.winfo_exists():
+            return
+
+        is_dark = self.dark_mode_var.get()
+        listening = self.listen_thread is not None and self.listen_thread.is_alive()
+        outer = "#B91C1C" if listening else ("#0D9488" if is_dark else "#0F766E")
+        inner = "#EF4444" if listening else "#14B8A6"
+        text_fg = "#F8FAFC"
+        ring = "#FCA5A5" if listening else ("#5EEAD4" if is_dark else "#99F6E4")
+
+        self.listen_canvas.configure(bg=self.colors["root_bg"])
+        self.listen_canvas.delete("all")
+        self.listen_canvas.create_oval(18, 18, 222, 222, fill=ring, outline="")
+        self.listen_canvas.create_oval(30, 30, 210, 210, fill=outer, outline="")
+        self.listen_canvas.create_oval(42, 42, 198, 198, fill=inner, outline="")
+        self.listen_canvas.create_text(
+            120,
+            92,
+            text="START",
+            fill="#CCFBF1" if is_dark else "#E6FFFA",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.listen_caption_id = self.listen_canvas.create_text(
+            120,
+            128,
+            text="Stop" if listening else "Listen",
+            fill=text_fg,
+            font=("Segoe UI Semibold", 22),
+        )
+
+    def _draw_listen_waveform(self) -> None:
+        if not self.listen_wave_canvas or not self.listen_wave_canvas.winfo_exists():
+            return
+
+        canvas = self.listen_wave_canvas
+        canvas.configure(bg=self.colors["root_bg"])
+        canvas.delete("all")
+
+        width = int(canvas.cget("width"))
+        height = int(canvas.cget("height"))
+        mid = height // 2
+        active = self.listen_thread is not None and self.listen_thread.is_alive()
+        trace_color = "#5EEAD4" if active else "#94A3B8"
+        line_color = "#1E293B" if self.dark_mode_var.get() else "#CBD5E1"
+
+        canvas.create_line(0, mid, width, mid, fill=line_color, width=1)
+        canvas.create_rectangle(0, 0, width - 1, height - 1, outline=line_color)
+
+        if not self.listen_wave_levels:
+            return
+        points: list[float] = []
+        denom = max(len(self.listen_wave_levels) - 1, 1)
+        for idx, sample in enumerate(self.listen_wave_levels):
+            x = (idx / denom) * (width - 1)
+            y = mid - (float(sample) * (height * 0.42))
+            points.extend((x, y))
+        canvas.create_line(points, fill=trace_color, width=2, smooth=True)
+
+    def _push_listen_level(self, level: float) -> None:
+        self._draw_listen_waveform()
+
+    def _set_listen_waveform(self, samples: list[float]) -> None:
+        if not samples:
+            self.listen_wave_levels = [0.0] * 160
+        else:
+            self.listen_wave_levels = [max(-1.0, min(1.0, float(sample))) for sample in samples]
+        self._draw_listen_waveform()
+
+    def _refresh_listen_found_card(self) -> None:
+        photo = self.listen_found_cover_photo or self._placeholder_cover()
+        if self.listen_found_cover_label and self.listen_found_cover_label.winfo_exists():
+            self.listen_found_cover_label.configure(image=photo)
+            self.listen_found_cover_label.image = photo
+
+        if self.listen_found_link_label and self.listen_found_link_label.winfo_exists():
+            self.listen_found_link_label.configure(cursor="hand2" if self.listen_found_url else "arrow")
+            if not self.listen_found_url:
+                self.listen_found_link_var.set("")
+
+    def _listen_source_label(self, source: str) -> str:
+        label_map = {
+            "local": "Local listen",
+            "system": "System audio",
+            "both": "Both",
+        }
+        return label_map.get(source, source)
+
+    def _listen_source_value(self, label: str) -> str:
+        value_map = {
+            "Local listen": "local",
+            "System audio": "system",
+            "Both": "both",
+        }
+        return value_map.get(label, "local")
+
+    def _refresh_listen_modal_theme(self) -> None:
+        if not self.listen_modal or not self.listen_modal.winfo_exists():
+            return
+
+        border = "#334155" if self.dark_mode_var.get() else "#CBD5E1"
+        self.listen_modal.configure(bg=self.colors["root_bg"])
+
+        for child in self.listen_modal.winfo_children():
+            self._refresh_listen_modal_widget(child, border)
+
+        self._draw_listen_button()
+        self._draw_listen_waveform()
+        self._refresh_listen_found_card()
+
+    def _refresh_listen_modal_widget(self, widget: tk.Widget, border: str) -> None:
+        if isinstance(widget, (tk.Frame, tk.LabelFrame)):
+            bg = self.colors["root_bg"]
+            if widget.winfo_children():
+                bg = self.colors["card_bg"] if any(isinstance(c, tk.Radiobutton) for c in widget.winfo_children()) else self.colors["root_bg"]
+            widget.configure(bg=bg)
+            if bg == self.colors["card_bg"]:
+                widget.configure(highlightbackground=border, highlightcolor=border)
+        elif isinstance(widget, tk.Label):
+            current_bg = str(widget.cget("bg"))
+            is_card = current_bg == self.colors["card_bg"] or widget.master is self.listen_options_frame or (
+                widget.master is not None and widget.master.master is self.listen_options_frame
+            )
+            widget.configure(bg=self.colors["card_bg"] if is_card else self.colors["root_bg"])
+            if is_card:
+                current_fg = str(widget.cget("fg"))
+                if current_fg.lower() in {"#38bdf8", "#0369a1"}:
+                    widget.configure(fg="#38BDF8" if self.dark_mode_var.get() else "#0369A1")
+                else:
+                    widget.configure(fg=self.colors["hint_fg"] if current_fg == self.colors["hint_fg"] else self.colors["text_fg"])
+        elif isinstance(widget, tk.Listbox):
+            widget.configure(
+                bg=self.colors["card_bg"],
+                fg=self.colors["text_fg"],
+                selectbackground="#0D9488" if self.dark_mode_var.get() else "#99F6E4",
+                selectforeground=self.colors["text_fg"],
+            )
+
+        for child in widget.winfo_children():
+            self._refresh_listen_modal_widget(child, border)
+
+    def _on_listen_source_change(self) -> None:
+        if self.listen_source_menu and self.listen_source_menu.winfo_exists():
+            self.listen_source_var.set(self._listen_source_value(self.listen_source_menu.get()))
+
+        source = self.listen_source_var.get()
+        label = self._listen_source_label(source)
+        if source == "local":
+            self.listen_hint_var.set("Local listen selected. This mode will use a microphone or line-in device.")
+        elif source == "system":
+            self.listen_hint_var.set("System audio selected. This mode will capture what the computer is currently playing.")
+        elif source == "both":
+            self.listen_hint_var.set("Both selected. This mode is intended to merge local input and system audio later.")
+        else:
+            self.listen_hint_var.set(f"Selected source: {label}.")
+
+    def _on_listen_pressed(self) -> None:
+        if self.listen_thread and self.listen_thread.is_alive():
+            self._stop_listening()
+            return
+
+        source = self.listen_source_var.get()
+        label = self._listen_source_label(source)
+        self.status_var.set(f"Starting listen mode: {label}")
+        self.listen_hint_var.set(f"Starting {label.lower()}...")
+        self._start_listening()
+
+    def _start_listening(self) -> None:
+        if self.listen_thread and self.listen_thread.is_alive():
+            return
+
+        self.listen_stop_event = threading.Event()
+        source = self.listen_source_var.get()
+        auto_preview = self.listen_auto_preview_var.get()
+
+        def worker() -> None:
+            try:
+                listener = LiveAudioListener(
+                    source=source,
+                    auto_preview=auto_preview,
+                    stop_event=self.listen_stop_event,
+                    on_status=lambda message: self.event_queue.put(("listen_status", message)),
+                    on_result=lambda result: self.event_queue.put(("listen_result", result)),
+                    on_level=lambda source_name, level: self.event_queue.put(("listen_level", {"source": source_name, "level": level})),
+                    on_wave=lambda source_name, samples: self.event_queue.put(("listen_wave", {"source": source_name, "samples": samples})),
+                    on_preview_ready=lambda source_name, path: None,
+                )
+                listener.run()
+                self.event_queue.put(("listen_finished", {"stopped": True}))
+            except AudioCaptureError as exc:
+                self.event_queue.put(("listen_finished", {"stopped": False, "error": str(exc)}))
+            except Exception as exc:
+                self.event_queue.put(("listen_finished", {"stopped": False, "error": str(exc)}))
+
+        self.listen_thread = threading.Thread(target=worker, daemon=True)
+        self.listen_thread.start()
+        self._draw_listen_button()
+
+    def _stop_listening(self) -> None:
+        if not (self.listen_thread and self.listen_thread.is_alive()):
+            return
+        self.listen_stop_event.set()
+        self.listen_hint_var.set("Stopping listen mode...")
+        self.status_var.set("Stopping listen mode...")
+        self._draw_listen_button()
+        self._draw_listen_waveform()
+
+    def _add_listen_result(self, result: LiveTrackResult) -> None:
+        stamp = time.strftime("%H:%M:%S", time.localtime(result.detected_at))
+        album = result.track.album or "Unknown album"
+        source_label = SOURCE_LABELS.get(result.source, result.source.title())
+        line = f"[{stamp}] {source_label}: {result.track.artist} - {result.track.title} | {album}"
+        self.listen_results.insert(0, line)
+        self.listen_results = self.listen_results[:40]
+        self._refresh_listen_results()
+        self.status_var.set(f"Matched {result.track.artist} - {result.track.title}")
+        self.listen_hint_var.set(f"Detected on {result.device_name}: {result.track.artist} - {result.track.title}")
+        self.listen_found_title_var.set(f"{result.track.artist} - {result.track.title}")
+        self.listen_found_meta_var.set(f"{album} | {source_label} | {stamp}")
+        self.listen_found_url = result.track.track_url
+        self.listen_found_link_var.set(result.track.track_url or "")
+        self.listen_found_cover_photo = self._cover_photo(self._fetch_cover_bytes(result.track.cover_url))
+        self._refresh_listen_found_card()
+
+    def _open_listen_found_link(self) -> None:
+        if self.listen_found_url:
+            webbrowser.open(self.listen_found_url)
+
+    def _refresh_listen_results(self) -> None:
+        items = self.listen_results if self.listen_results else ["No matches yet."]
+        self.listen_results_var.set(tuple(items))
+        if self.listen_results_list and self.listen_results_list.winfo_exists():
+            self.listen_results_list.selection_clear(0, "end")
+
+    def _clear_listen_results(self) -> None:
+        self.listen_results.clear()
+        self._refresh_listen_results()
+        self.listen_hint_var.set("Results cleared. Choose a source and press Listen.")
+        self.listen_found_title_var.set("No track found yet")
+        self.listen_found_meta_var.set("Start listening to show the latest match.")
+        self.listen_found_url = None
+        self.listen_found_link_var.set("")
+        self.listen_found_cover_photo = None
+        self._refresh_listen_found_card()
+
+    def _close_listen_modal(self) -> None:
+        self._stop_listening()
+        if self.listen_modal and self.listen_modal.winfo_exists():
+            self.listen_modal.grab_release()
+            self.listen_modal.destroy()
+        self.listen_modal = None
+        self.listen_canvas = None
+        self.listen_caption_id = None
+        self.listen_options_frame = None
+        self.listen_source_menu = None
+        self.listen_results_list = None
+        self.listen_wave_canvas = None
+        self.listen_found_cover_label = None
+        self.listen_found_link_label = None
 
     def _show_row_menu(self, event: tk.Event, path: str) -> None:
         self._set_selected_row(path)
@@ -844,6 +1347,24 @@ class PythonShazzamGUI(tk.Tk):
         else:
             self.status_var.set(f"Done. Updated: {processed}, skipped: {skipped}, errors: {errors}")
 
+    def _finish_listen(self, result: dict[str, object]) -> None:
+        error = str(result.get("error", "")).strip()
+        if error:
+            self.status_var.set(f"Listen failed: {error}")
+            self.listen_hint_var.set(f"Listen failed: {error}")
+            if self.listen_modal and self.listen_modal.winfo_exists():
+                messagebox.showerror("Listen failed", error)
+        else:
+            self.status_var.set("Listen mode stopped")
+            self.listen_hint_var.set("Choose a source and press Listen.")
+
+        self.listen_thread = None
+        self.listen_stop_event = threading.Event()
+        self.listen_wave_levels = [0.0] * 160
+        self._draw_listen_button()
+        self._draw_listen_waveform()
+        self._refresh_listen_found_card()
+
     def _drain_events(self) -> None:
         while True:
             try:
@@ -866,6 +1387,21 @@ class PythonShazzamGUI(tk.Tk):
                 self._apply_row_result(payload)
             elif kind == "run_done" and isinstance(payload, dict):
                 self._finish_run(payload)
+            elif kind == "listen_status" and isinstance(payload, str):
+                self.listen_hint_var.set(payload)
+                self.status_var.set(payload)
+            elif kind == "listen_result" and isinstance(payload, LiveTrackResult):
+                self._add_listen_result(payload)
+            elif kind == "listen_level" and isinstance(payload, dict):
+                level = payload.get("level", 0.0)
+                if isinstance(level, (int, float)):
+                    self._push_listen_level(float(level))
+            elif kind == "listen_wave" and isinstance(payload, dict):
+                samples = payload.get("samples", [])
+                if isinstance(samples, list):
+                    self._set_listen_waveform(samples)
+            elif kind == "listen_finished" and isinstance(payload, dict):
+                self._finish_listen(payload)
 
         self.after(80, self._drain_events)
 
@@ -874,6 +1410,7 @@ class PythonShazzamGUI(tk.Tk):
             if not messagebox.askyesno("Exit", "Processing is running. Stop and close?"):
                 return
             self.stop_event.set()
+        self._close_listen_modal()
         self.destroy()
 
 

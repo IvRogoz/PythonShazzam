@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.2.0] - 2026-03-28
+
+### Added
+- Live `Listen Mode` modal in `gui.py` with:
+  - source selector for `System audio`, `Local listen`, and `Both`
+  - large listen/stop control
+  - real-time waveform display
+  - latest-found track card with cover art and external link
+  - rolling live-results list
+  - auto-preview toggle for playing the captured sample before Shazam recognition
+- New live capture backend module: `system_audio.py`.
+- Byte-based Shazam recognition path in `music.py` for captured live audio.
+
+### Changed
+- `System audio` capture now prefers `Stereo Mix` when available and falls back to Windows loopback capture.
+- `run_gui.bat` now repairs missing GUI/listen dependencies automatically and avoids broken `pip --user` behavior inside the project virtualenv.
+- `README.md` expanded with live listen-mode usage notes.
+- `requirements.txt` updated to include `soundcard` and `sounddevice`.
+
+### Fixed
+- Listen-mode Windows COM initialization issues during background audio startup.
+- Several listen-mode preview/recognition flow bugs in the Tk GUI and audio worker path.
+
 ## [1.1.0] - 2026-02-23
 
 ### Added

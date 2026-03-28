@@ -50,12 +50,26 @@ The GUI lets you:
 - view embedded title/artist/album and whether cover art is already embedded
 - preview embedded cover art for selected files
 - run/stop processing with live per-file status updates
+- open `Listen Mode` for live Shazam detection from:
+  - `System audio` using Windows output capture
+  - `Local listen` using the default microphone
+  - `Both`
+- watch a real-time waveform while listening
+- optionally auto-preview the captured sample before it is sent to Shazam
+- see the latest detected track with cover art and external track link
+- see a rolling live-results list for recognized tracks
 - toggle `Auto apply changes`:
   - ON: writes rename/tags during processing
   - OFF: detects and fills pending info without writing; use `Apply Pending` to commit later
 - preview Shazam cover art in pending mode before writing
 - right-click a row for `Open File`, `Open Folder`, and `Rescan Item`
 - starts in dark mode with a toggle for light mode
+
+### Listen Mode Notes
+
+- `System audio` prefers `Stereo Mix` when available and falls back to loopback capture if needed.
+- Automatic preview can be turned off from the modal if you want direct recognition without playback.
+- Live recognition uses rolling captured samples and may need several seconds of audio before the first Shazam attempt.
 
 ## Build EXE (Windows)
 

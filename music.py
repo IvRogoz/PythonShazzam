@@ -35,6 +35,7 @@ class TrackInfo:
     title: str
     album: Optional[str] = None
     cover_url: Optional[str] = None
+    track_url: Optional[str] = None
 
 @dataclass
 class FileResult:
@@ -139,19 +140,34 @@ def extract_trackinfo_from_shazam(payload: dict) -> Optional[TrackInfo]:
 
         images = track.get("images", {}) or {}
         cover = images.get("coverarthq") or images.get("coverart") or images.get("background") or None
+        track_url = track.get("url")
+        if not track_url:
+            share = track.get("share", {}) or {}
+            track_url = share.get("href") or share.get("html")
 
         artist = MULTISPACE_RE.sub(" ", artist).strip()
         title = MULTISPACE_RE.sub(" ", title).strip()
         if album:
             album = MULTISPACE_RE.sub(" ", album).strip()
 
-        return TrackInfo(artist=artist, title=title, album=album, cover_url=cover)
+        return TrackInfo(artist=artist, title=title, album=album, cover_url=cover, track_url=track_url)
     except Exception:
         return None
 
 async def shazam_identify_file(shazam: Shazam, file_path: Path, timeout: float = 40.0) -> Optional[TrackInfo]:
     try:
         payload = await asyncio.wait_for(shazam.recognize(str(file_path)), timeout=timeout)
+        if not payload:
+            return None
+        return extract_trackinfo_from_shazam(payload) or None
+    except asyncio.TimeoutError:
+        return None
+    except Exception:
+        return None
+
+async def shazam_identify_bytes(shazam: Shazam, data: bytes, timeout: float = 40.0) -> Optional[TrackInfo]:
+    try:
+        payload = await asyncio.wait_for(shazam.recognize(data), timeout=timeout)
         if not payload:
             return None
         return extract_trackinfo_from_shazam(payload) or None
